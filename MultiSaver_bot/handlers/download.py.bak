@@ -1,0 +1,222 @@
+﻿import logging
+from pathlib import Path
+
+from aiogram import F, Router
+from aiogram.filters import Command
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    FSInputFile,
+    Message,
+)
+
+from MultiSaver_bot.config import get_settings
+from MultiSaver_bot.database.models import User
+from MultiSaver_bot.database.repository import HistoryRepository
+from MultiSaver_bot.database.session import async_session_factory
+from MultiSaver_bot.keyboards.main_menu import main_menu_kb
+from MultiSaver_bot.keyboards.media_actions import media_actions_kb
+from MultiSaver_bot.services.downloader import download_media
+from MultiSaver_bot.services.file_manager import get_file_manager
+from MultiSaver_bot.services.job_store import get_job_store
+from MultiSaver_bot.services.url_validator import is_supported_url
+from MultiSaver_bot.utils.errors import MultiSaverError, RateLimitError
+from MultiSaver_bot.utils.i18n import get_text
+
+logger = logging.getLogger(__name__)
+router = Router(name="download")
+
+
+@router.callback_query(F.data == "menu:download")
+async def cb_download_prompt(callback: CallbackQuery, lang: str) -> None:
+    await callback.answer()
+    await callback.message.answer(get_text("download.prompt", lang))
+
+
+@router.message(F.text)
+async def handle_possible_url(message: Message, db_user: User, lang: str) -> None:
+    """Process messages that look like media URLs."""
+    text = (message.text or "").strip()
+    if not text or text.startswith("/"):
+        return
+
+    # Quick filter: must look like a URL
+    if not any(
+        x in text.lower()
+        for x in (
+            "http",
+            "instagram",
+            "instagr.am",
+            "t.me",
+            "facebook",
+            "fb.",
+            "pinterest",
+            "pin.it",
+            "snapchat",
+        )
+    ):
+        return
+
+    if not is_supported_url(text):
+        await message.answer(get_text("download.invalid_url", lang))
+        return
+
+    status_msg = await message.answer(get_text("download.processing", lang))
+    settings = get_settings()
+    fm = get_file_manager()
+    job_store = get_job_store()
+
+    try:
+        result = await download_media(text)
+    except RateLimitError as exc:
+        await status_msg.edit_text(
+            get_text("download.rate_limit", lang, seconds=exc.seconds)
+        )
+        await _record_history(db_user.telegram_id, "unknown", "failed", "rate_limit")
+        return
+    except MultiSaverError as exc:
+        key = exc.error_key
+        kwargs = {}
+        if key == "download.too_large":
+            kwargs["max_mb"] = settings.max_file_size_mb
+        if key == "download.rate_limit" and hasattr(exc, "seconds"):
+            kwargs["seconds"] = exc.seconds
+        await status_msg.edit_text(get_text(key, lang, **kwargs))
+        platform = "unknown"
+        try:
+            from MultiSaver_bot.services.url_validator import detect_platform
+            platform = detect_platform(text) or "unknown"
+        except Exception:
+            pass
+        await _record_history(
+            db_user.telegram_id, platform, "failed", getattr(exc, "error_key", "error")
+        )
+        return
+    except Exception:
+        logger.exception("Unexpected download error")
+        await status_msg.edit_text(get_text("download.internal_error", lang))
+        await _record_history(db_user.telegram_id, "unknown", "failed", "internal")
+        return
+
+    # Store job for action buttons
+    job_id = job_store.create(
+        user_id=db_user.telegram_id,
+        files=result.files,
+        media_type=result.media_type,
+        platform=result.platform,
+        original_url=result.original_url,
+        can_extract_audio=result.can_extract_audio,
+    )
+
+    kb = media_actions_kb(
+        job_id=job_id,
+        lang=lang,
+        media_type=result.media_type,
+        can_extract_audio=result.can_extract_audio,
+    )
+
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
+    sent = False
+    for i, fpath in enumerate(result.files):
+        try:
+            input_file = FSInputFile(fpath)
+            caption = get_text("download.success", lang) if i == 0 else None
+            markup = kb if i == len(result.files) - 1 else None
+
+            if result.media_type == "video" or (
+                result.media_type == "carousel" and fpath.suffix.lower() in {".mp4", ".webm", ".mov"}
+            ):
+                await message.answer_video(
+                    input_file,
+                    caption=caption,
+                    reply_markup=markup,
+                )
+            elif result.media_type in ("image", "carousel"):
+                await message.answer_photo(
+                    input_file,
+                    caption=caption,
+                    reply_markup=markup,
+                )
+            elif result.media_type == "audio":
+                await message.answer_audio(
+                    input_file,
+                    caption=caption,
+                    reply_markup=markup,
+                )
+            else:
+                await message.answer_document(
+                    input_file,
+                    caption=caption,
+                    reply_markup=markup,
+                )
+            sent = True
+        except Exception:
+            logger.exception("Failed to send media file %s", fpath)
+            # Fallback: send as document
+            try:
+                await message.answer_document(
+                    FSInputFile(fpath),
+                    caption=caption,
+                    reply_markup=markup,
+                )
+                sent = True
+            except Exception:
+                logger.exception("Document fallback also failed")
+
+    if not sent:
+        await message.answer(get_text("download.failed", lang))
+        await _record_history(
+            db_user.telegram_id, result.platform, "failed", "upload"
+        )
+        # Cleanup
+        for f in result.files:
+            await fm.cleanup(f)
+        job_store.remove(job_id)
+        return
+
+    # If only one file and markup was not attached (edge case), send control message
+    if len(result.files) > 1:
+        await message.answer(
+            get_text("download.success", lang),
+            reply_markup=kb,
+        )
+
+    total_size = sum(fm.get_size(f) for f in result.files)
+    await _record_history(
+        db_user.telegram_id,
+        result.platform,
+        "success",
+        media_type=result.media_type,
+        file_size=total_size,
+    )
+
+    # Note: files are kept until job TTL so audio/save can work.
+    # Periodic cleanup handles old jobs.
+
+
+async def _record_history(
+    user_id: int,
+    platform: str,
+    status: str,
+    error_category: str | None = None,
+    media_type: str | None = None,
+    file_size: int | None = None,
+) -> None:
+    try:
+        async with async_session_factory() as session:
+            repo = HistoryRepository(session)
+            await repo.add(
+                user_id=user_id,
+                platform=platform,
+                status=status,
+                media_type=media_type,
+                error_category=error_category,
+                file_size=file_size,
+            )
+            await session.commit()
+    except Exception:
+        logger.exception("Failed to record history")
